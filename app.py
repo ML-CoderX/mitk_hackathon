@@ -7,6 +7,7 @@ import os
 import re
 import statistics
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -25,6 +26,7 @@ EVALUATION_LOCK = threading.Lock()
 MODEL_LOCK = threading.Lock()
 MODEL_COOLDOWNS = {}
 PREFERRED_MODEL = None
+SAVE_LOCK = threading.Lock()
 
 
 class GeminiError(ValueError):
@@ -34,10 +36,50 @@ class GeminiError(ValueError):
 
 
 def save_json(path, value):
+    """Keep the last valid report intact while retrying Windows sharing locks."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    payload = json.dumps(value, ensure_ascii=False, indent=2)
+    with SAVE_LOCK:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                dir=path.parent, prefix=path.stem + '-', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(8):
+            try:
+                temporary.replace(path)
+                return
+            except OSError as error:
+                if not isinstance(error, PermissionError) and getattr(error, 'winerror', None) not in (5, 32, 33):
+                    raise
+                if attempt < 7:
+                    time.sleep(min(0.1 * 2 ** attempt, 1.0))
+        raise ValueError(
+            f'Windows is preventing an update to {path.name}. '
+            'The previous result is intact and the new result is saved in a recovery file. '
+            'Close any program holding the results file, then click Run / resume. '
+            'Completed API responses will be reused.')
+
+
+def cached_record(inputs, model, compressed_context):
+    """Recover completed API stages, including a failed rename from older builds."""
+    paths = list(RESULTS.glob('pair-*.json')) + list(RESULTS.glob('pair-*.tmp'))
+    best, best_score = None, (-1, -1)
+    fields = ('original_context_tokens', 'compressed_context_tokens', 'original_answer', 'compressed_answer')
+    for path in paths:
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if (value.get('inputs') != inputs or value.get('model') != model or
+                    value.get('compression', {}).get('compressed_context') != compressed_context):
+                continue
+            score = (sum(field in value for field in fields), path.stat().st_mtime_ns)
+            if score > best_score:
+                best, best_score = value, score
+        except (OSError, ValueError, AttributeError):
+            continue
+    return best
 
 
 def load_dataset():
@@ -264,11 +306,16 @@ def compare_automatically(case, candidates=None):
     with MODEL_LOCK:
         preferred = PREFERRED_MODEL
         cooldowns = dict(MODEL_COOLDOWNS)
-    candidates.sort(key=lambda m: m['name'] != preferred)
+    inputs = case_inputs(case)
+    compressed = compress(**inputs)['compressed_context']
+    def cached_stages(candidate):
+        record = cached_record(inputs, validate_model(candidate['name']), compressed) or {}
+        return sum(field in record for field in ('original_context_tokens', 'compressed_context_tokens', 'original_answer', 'compressed_answer'))
+    candidates.sort(key=lambda m: (-cached_stages(m), m['name'] != preferred))
     attempts = []
     for candidate in candidates:
         name = candidate['name']
-        if cooldowns.get(name, 0) > time.monotonic():
+        if cooldowns.get(name, 0) > time.monotonic() and cached_stages(candidate) < 4:
             continue
         try:
             record = compare(case, name)
@@ -323,7 +370,7 @@ def compare(case, model):
     fingerprint = hashlib.sha256(json.dumps({'inputs': inputs, 'model': model,
         'code': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}, sort_keys=True).encode()).hexdigest()
     path = RESULTS / f'pair-{fingerprint}.json'
-    record = json.loads(path.read_text(encoding='utf-8')) if path.exists() else dict(
+    record = cached_record(inputs, model, compression['compressed_context']) or dict(
         model=model, inputs=inputs, compression=compression,
         human_review={'original_score': None, 'compressed_score': None, 'notes': ''})
     for kind, context in [('original', inputs['context']), ('compressed', compression['compressed_context'])]:
@@ -385,7 +432,11 @@ def batch_evaluate(model='automatic'):
     except Exception as error:
         with JOB_LOCK:
             JOB['error'] = str(error)
-        save_json(RESULTS / 'gemini-evaluation.json', dict(status='paused', model=model, completed_cases=len(records), error=str(error), answer_quality_evaluated=False, records=records))
+        try:
+            save_json(RESULTS / 'gemini-evaluation.json', dict(status='paused', model=model, completed_cases=len(records), error=str(error), answer_quality_evaluated=False, records=records))
+        except ValueError as save_error:
+            with JOB_LOCK:
+                JOB['error'] += ' ' + str(save_error)
     finally:
         with JOB_LOCK:
             JOB['running'] = False
