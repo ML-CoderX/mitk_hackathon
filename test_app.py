@@ -64,6 +64,29 @@ class CompressionTests(unittest.TestCase):
 
 
 class GeminiTests(unittest.TestCase):
+    def test_automatic_selection_falls_back_and_remembers_working_model(self):
+        candidates = [{'name': 'models/gemini-a'}, {'name': 'models/gemini-b'}]
+        with patch.object(app, 'MODEL_COOLDOWNS', {}), patch.object(app, 'PREFERRED_MODEL', None), \
+             patch.object(app, 'automatic_models', return_value=candidates), \
+             patch.object(app, 'compare', side_effect=[app.GeminiError(429, 'Quota'), {'model': 'gemini-b'}, {'model': 'gemini-b'}]) as compare:
+            result = app.compare_automatically(app.load_dataset()[0])
+            self.assertEqual(result['model'], 'gemini-b')
+            self.assertEqual(result['fallback_attempts'], [{'model': 'models/gemini-a', 'status': 429}])
+            app.compare_automatically(app.load_dataset()[0])
+            self.assertEqual([call.args[1] for call in compare.call_args_list],
+                             ['models/gemini-a', 'models/gemini-b', 'models/gemini-b'])
+
+    def test_automatic_selection_does_not_retry_invalid_key(self):
+        with patch.object(app, 'MODEL_COOLDOWNS', {}), patch.object(app, 'compare', side_effect=app.GeminiError(403, 'Access denied')) as compare:
+            with self.assertRaises(app.GeminiError):
+                app.compare_automatically(app.load_dataset()[0], [{'name': 'models/gemini-a'}, {'name': 'models/gemini-b'}])
+            self.assertEqual(compare.call_count, 1)
+
+    def test_automatic_discovery_excludes_media_models(self):
+        names = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-image', 'gemini-tts', 'gemini-deep-research', 'gemma-3']
+        with patch.object(app, 'list_models', return_value=[{'name': 'models/' + n, 'displayName': n} for n in names]):
+            self.assertEqual([m['name'] for m in app.automatic_models()], ['models/gemini-2.5-flash-lite', 'models/gemini-2.5-flash'])
+
     def test_resume_caches_completed_stages(self):
         case = app.load_dataset()[0]
         cache_before = set(app.RESULTS.glob('pair-*.json')) if app.RESULTS.exists() else set()
