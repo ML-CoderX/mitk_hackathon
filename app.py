@@ -7,6 +7,7 @@ import os
 import re
 import statistics
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -22,13 +23,63 @@ STOP = set('a an the is are was were to of in on for and or with it this that wh
 JOB = {'running': False, 'done': 0, 'total': 0, 'error': None}
 JOB_LOCK = threading.Lock()
 EVALUATION_LOCK = threading.Lock()
+MODEL_LOCK = threading.Lock()
+MODEL_COOLDOWNS = {}
+PREFERRED_MODEL = None
+SAVE_LOCK = threading.Lock()
+
+
+class GeminiError(ValueError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 def save_json(path, value):
+    """Keep the last valid report intact while retrying Windows sharing locks."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    payload = json.dumps(value, ensure_ascii=False, indent=2)
+    with SAVE_LOCK:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                dir=path.parent, prefix=path.stem + '-', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(8):
+            try:
+                temporary.replace(path)
+                return
+            except OSError as error:
+                if not isinstance(error, PermissionError) and getattr(error, 'winerror', None) not in (5, 32, 33):
+                    raise
+                if attempt < 7:
+                    time.sleep(min(0.1 * 2 ** attempt, 1.0))
+        raise ValueError(
+            f'Windows is preventing an update to {path.name}. '
+            'The previous result is intact and the new result is saved in a recovery file. '
+            'Close any program holding the results file, then click Run / resume. '
+            'Completed API responses will be reused.')
+
+
+def cached_record(inputs, model, compressed_context):
+    """Recover completed API stages, including a failed rename from older builds."""
+    paths = list(RESULTS.glob('pair-*.json')) + list(RESULTS.glob('pair-*.tmp'))
+    best, best_score = None, (-1, -1)
+    fields = ('original_context_tokens', 'compressed_context_tokens', 'original_answer', 'compressed_answer')
+    for path in paths:
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if (value.get('inputs') != inputs or value.get('model') != model or
+                    value.get('compression', {}).get('compressed_context') != compressed_context):
+                continue
+            score = (sum(field in value for field in fields), path.stat().st_mtime_ns)
+            if score > best_score:
+                best, best_score = value, score
+        except (OSError, ValueError, AttributeError):
+            continue
+    return best
 
 
 def load_dataset():
@@ -212,7 +263,7 @@ def gemini_request(path, payload=None):
         messages = {400: 'Check the model and request settings.', 401: 'API key rejected.',
                     403: 'Access denied. Check key restrictions.', 404: 'Model unavailable.',
                     429: 'Quota or rate limit reached. Wait, then resume.', 503: 'Gemini temporarily unavailable.'}
-        raise ValueError(f'Gemini HTTP {error.code}. ' + messages.get(error.code, 'Request failed.')) from None
+        raise GeminiError(error.code, f'Gemini HTTP {error.code}. ' + messages.get(error.code, 'Request failed.')) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise ValueError('Network or timeout failure. No automatic retry was made; a timed-out request may still incur usage.') from None
 
@@ -226,6 +277,62 @@ def list_models():
         token = response.get('nextPageToken')
         if not token:
             return result
+
+
+def automatic_models():
+    """Discover advertised text models; actual requests establish usability."""
+    excluded = ('tts', 'image', 'banana', 'audio', 'transcribe', 'lyria',
+                'robotics', 'computer-use', 'deep-research', 'agent', 'omni')
+    candidates = [m for m in list_models()
+                  if m['name'].startswith('models/gemini-')
+                  and not any(word in (m['name'] + ' ' + m['displayName']).lower()
+                              for word in excluded)]
+    def rank(model):
+        name = model['name'].lower()
+        return ('preview' in name or 'experimental' in name or '-exp' in name,
+                0 if 'flash-lite' in name else 1 if 'flash' in name else 2,
+                name)
+    candidates.sort(key=rank)
+    if not candidates:
+        raise ValueError('No compatible Gemini text models were returned for this API key.')
+    return candidates
+
+
+def compare_automatically(case, candidates=None):
+    """Use one working model for both answers, falling back on model errors."""
+    global PREFERRED_MODEL
+    compress(**case_inputs(case))  # Validate input before making remote requests.
+    candidates = list(candidates if candidates is not None else automatic_models())
+    with MODEL_LOCK:
+        preferred = PREFERRED_MODEL
+        cooldowns = dict(MODEL_COOLDOWNS)
+    inputs = case_inputs(case)
+    compressed = compress(**inputs)['compressed_context']
+    def cached_stages(candidate):
+        record = cached_record(inputs, validate_model(candidate['name']), compressed) or {}
+        return sum(field in record for field in ('original_context_tokens', 'compressed_context_tokens', 'original_answer', 'compressed_answer'))
+    candidates.sort(key=lambda m: (-cached_stages(m), m['name'] != preferred))
+    attempts = []
+    for candidate in candidates:
+        name = candidate['name']
+        if cooldowns.get(name, 0) > time.monotonic() and cached_stages(candidate) < 4:
+            continue
+        try:
+            record = compare(case, name)
+        except GeminiError as error:
+            if error.status not in (400, 404, 429, 500, 502, 503):
+                raise
+            attempts.append({'model': name, 'status': error.status})
+            with MODEL_LOCK:
+                MODEL_COOLDOWNS[name] = time.monotonic() + (60 if error.status == 429 else 300)
+            continue
+        with MODEL_LOCK:
+            PREFERRED_MODEL = name
+            MODEL_COOLDOWNS.pop(name, None)
+        record['automatic_selection'] = True
+        record['fallback_attempts'] = attempts
+        return record
+    raise ValueError('No available text model could complete this request. Models are unavailable or quota-limited. Wait a minute and try again. No successful cached stages were lost.')
 
 
 def actual_tokens(model, text):
@@ -263,7 +370,7 @@ def compare(case, model):
     fingerprint = hashlib.sha256(json.dumps({'inputs': inputs, 'model': model,
         'code': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}, sort_keys=True).encode()).hexdigest()
     path = RESULTS / f'pair-{fingerprint}.json'
-    record = json.loads(path.read_text(encoding='utf-8')) if path.exists() else dict(
+    record = cached_record(inputs, model, compression['compressed_context']) or dict(
         model=model, inputs=inputs, compression=compression,
         human_review={'original_score': None, 'compressed_score': None, 'notes': ''})
     for kind, context in [('original', inputs['context']), ('compressed', compression['compressed_context'])]:
@@ -307,13 +414,14 @@ def offline_benchmark():
     return report
 
 
-def batch_evaluate(model):
+def batch_evaluate(model='automatic'):
     records = []
     try:
+        candidates = automatic_models()
         for case in load_dataset():
             with JOB_LOCK:
                 JOB['current'] = case['id']
-            record = dict(compare(case, model))
+            record = dict(compare_automatically(case, candidates))
             record.update({k: case[k] for k in ('id', 'category', 'split', 'expected_answer', 'required_facts')})
             records.append(record)
             save_json(RESULTS / 'gemini-evaluation.json', dict(status='running', model=model, completed_cases=len(records), answer_quality_evaluated=False, records=records))
@@ -324,7 +432,11 @@ def batch_evaluate(model):
     except Exception as error:
         with JOB_LOCK:
             JOB['error'] = str(error)
-        save_json(RESULTS / 'gemini-evaluation.json', dict(status='paused', model=model, completed_cases=len(records), error=str(error), answer_quality_evaluated=False, records=records))
+        try:
+            save_json(RESULTS / 'gemini-evaluation.json', dict(status='paused', model=model, completed_cases=len(records), error=str(error), answer_quality_evaluated=False, records=records))
+        except ValueError as save_error:
+            with JOB_LOCK:
+                JOB['error'] += ' ' + str(save_error)
     finally:
         with JOB_LOCK:
             JOB['running'] = False
@@ -390,12 +502,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not EVALUATION_LOCK.acquire(blocking=False):
                     raise ValueError('Wait for the active comparison or batch to finish.')
                 try:
-                    result = compare(body, body.get('model'))
+                    result = compare_automatically(body)
                 finally:
                     EVALUATION_LOCK.release()
                 self.send(200, result)
             elif self.path == '/api/evaluate':
-                model = validate_model(body.get('model'))
+                model = 'automatic'
                 load_key()
                 total = len(load_dataset())
                 if not EVALUATION_LOCK.acquire(blocking=False):

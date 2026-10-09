@@ -11,6 +11,53 @@ from unittest.mock import patch
 import app
 
 
+class SaveTests(unittest.TestCase):
+    def test_transient_windows_lock_is_retried(self):
+        path = app.RESULTS / 'test-save-lock.json'
+        original = Path.replace
+        calls = []
+        def replace(source, destination):
+            calls.append(source)
+            if len(calls) < 3:
+                raise PermissionError('Simulated Windows sharing lock')
+            return original(source, destination)
+        try:
+            with patch.object(Path, 'replace', replace), patch.object(app.time, 'sleep'):
+                app.save_json(path, {'saved': True})
+            self.assertEqual(json.loads(path.read_text()), {'saved': True})
+            self.assertEqual(len(calls), 3)
+            self.assertFalse(calls[0].exists())
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_permanent_lock_preserves_previous_and_recovery_copy(self):
+        path = app.RESULTS / 'test-save-persistent.json'
+        app.save_json(path, {'previous': True})
+        try:
+            with patch.object(Path, 'replace', side_effect=PermissionError('locked')), patch.object(app.time, 'sleep'):
+                with self.assertRaisesRegex(ValueError, 'recovery file'):
+                    app.save_json(path, {'new': True})
+            self.assertEqual(json.loads(path.read_text()), {'previous': True})
+            pending = list(app.RESULTS.glob('test-save-persistent-*.tmp'))
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(json.loads(pending[0].read_text()), {'new': True})
+        finally:
+            path.unlink(missing_ok=True)
+            for pending in app.RESULTS.glob('test-save-persistent-*.tmp'):
+                pending.unlink()
+
+    def test_cache_recovers_more_complete_pending_record(self):
+        inputs = {'test': 'recovery-fixture'}
+        record = dict(inputs=inputs, model='fixture', compression={'compressed_context': 'retained'}, original_answer={'text': 'answer'})
+        path = app.RESULTS / 'pair-test-recovery.tmp'
+        try:
+            path.write_text(json.dumps(record))
+            self.assertEqual(app.cached_record(inputs, 'fixture', 'retained'), record)
+            self.assertIsNone(app.cached_record(inputs, 'fixture', 'changed'))
+        finally:
+            path.unlink(missing_ok=True)
+
+
 class CompressionTests(unittest.TestCase):
     def test_dataset_integrity(self):
         cases = app.load_dataset()
@@ -64,6 +111,29 @@ class CompressionTests(unittest.TestCase):
 
 
 class GeminiTests(unittest.TestCase):
+    def test_automatic_selection_falls_back_and_remembers_working_model(self):
+        candidates = [{'name': 'models/gemini-a'}, {'name': 'models/gemini-b'}]
+        with patch.object(app, 'MODEL_COOLDOWNS', {}), patch.object(app, 'PREFERRED_MODEL', None), \
+             patch.object(app, 'automatic_models', return_value=candidates), \
+             patch.object(app, 'compare', side_effect=[app.GeminiError(429, 'Quota'), {'model': 'gemini-b'}, {'model': 'gemini-b'}]) as compare:
+            result = app.compare_automatically(app.load_dataset()[0])
+            self.assertEqual(result['model'], 'gemini-b')
+            self.assertEqual(result['fallback_attempts'], [{'model': 'models/gemini-a', 'status': 429}])
+            app.compare_automatically(app.load_dataset()[0])
+            self.assertEqual([call.args[1] for call in compare.call_args_list],
+                             ['models/gemini-a', 'models/gemini-b', 'models/gemini-b'])
+
+    def test_automatic_selection_does_not_retry_invalid_key(self):
+        with patch.object(app, 'MODEL_COOLDOWNS', {}), patch.object(app, 'compare', side_effect=app.GeminiError(403, 'Access denied')) as compare:
+            with self.assertRaises(app.GeminiError):
+                app.compare_automatically(app.load_dataset()[0], [{'name': 'models/gemini-a'}, {'name': 'models/gemini-b'}])
+            self.assertEqual(compare.call_count, 1)
+
+    def test_automatic_discovery_excludes_media_models(self):
+        names = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-image', 'gemini-tts', 'gemini-deep-research', 'gemma-3']
+        with patch.object(app, 'list_models', return_value=[{'name': 'models/' + n, 'displayName': n} for n in names]):
+            self.assertEqual([m['name'] for m in app.automatic_models()], ['models/gemini-2.5-flash-lite', 'models/gemini-2.5-flash'])
+
     def test_resume_caches_completed_stages(self):
         case = app.load_dataset()[0]
         cache_before = set(app.RESULTS.glob('pair-*.json')) if app.RESULTS.exists() else set()

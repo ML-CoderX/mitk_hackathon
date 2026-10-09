@@ -19,14 +19,14 @@ The server generates the dataset on first start if missing. To change ports, set
 2. Inspect section decisions; try `constant_dependency`, `dependency_chain`, and `table_join`.
 3. Run the offline benchmark and download its JSON report.
 4. For Gemini evaluation, set `GEMINI_API_KEY=your_key` in `.env`; see `.env.example`. Environment variables take priority.
-5. Load available models, choose a text model, and compare one example.
-6. Run/resume all 40 cases with the same model. Each successful API stage is saved to `results/`.
+5. Click **Compare this example**. The server discovers compatible Gemini text models and automatically uses one that can complete your request. There is no model picker. If a model is unavailable or quota-limited, the server tries another; both answers in a comparison always use the same model.
+6. Run/resume all 40 cases. Selection is automatic for each case, and each record identifies the model actually used. Every successful API stage is cached under its model in `results/`. Models that fail are temporarily skipped; working models are preferred for later cases.
 
 Gemini comparisons send the system prompt, reference context and question to Google.
-An uncached full batch uses 80 generations and up to 80 countTokens calls. API quota
+An uncached full batch uses 80 successful generations and up to 80 countTokens calls for the selected models. Model fallback can add requests. API quota
 and charges may apply. Local compression and offline benchmarking make no API calls.
-Keep the server running during a batch. After interruption, rerun with the same
-model to reuse cached stages. Never commit or submit `.env`.
+Keep the server running during a batch. After interruption, rerun to reuse matching cached stages. A batch can contain
+different models, so compare quality per model when reviewing the report. Never commit or submit `.env`.
 
 ## Method and limitations
 
